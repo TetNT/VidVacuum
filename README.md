@@ -1,7 +1,7 @@
 
 # vidvacuum
 
-A Spring Boot application for video processing.
+A Spring Boot application for social media video download.
 
 ## Prerequisites
 
@@ -37,7 +37,7 @@ docker build -t vidvacuum:latest .
 ### Run Container
 
 ```bash
-docker run -p 8080:8080 -v ${PWD}/downloads:/home/appuser/downloads --name vidvacuum vidvacuum
+docker run -p 8080:8080 --name vidvacuum vidvacuum
 ```
 
 The application will be accessible at `http://localhost:8080`
