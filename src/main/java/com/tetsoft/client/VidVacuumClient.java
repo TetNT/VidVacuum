@@ -17,6 +17,11 @@ import java.io.InputStreamReader;
 import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 public class VidVacuumClient {
@@ -36,16 +41,40 @@ public class VidVacuumClient {
     private String notFoundCueLine = "HTTP Error 404: Not Found";
     private String privateVideoCueLine = "Private video. Sign in if you've been granted access to this video.";
 
-    public Resource getVideoAsResource(String url, String format) {
-        ResponseDto responseDto = downloadVideo(url, format);
-        if (responseDto instanceof SuccessResponseDto) {
-            SuccessResponseDto successResponseDto = (SuccessResponseDto) responseDto;
-            File file = new File(outputPath, successResponseDto.resultFileName());
-            return new FileSystemResource(file);
-        }
-        return null;
+    private final AtomicReference<String> lastDownloadProgress = new AtomicReference<>("0%");
+    private final AtomicReference<String> lastDownloadProgressLine = new AtomicReference<>("");
+    private final AtomicBoolean isDownloading = new AtomicBoolean(false);
+    private final Pattern downloadProgressPattern = Pattern.compile("\\[download]\\s*([0-9]{1,3}(?:\\.[0-9]+)?)%", Pattern.CASE_INSENSITIVE);
+    private final ConcurrentHashMap<String, String> downloadedFilePathByKey = new ConcurrentHashMap<>();
+
+    private final Long ONE_GB = 1_073_741_824L;
+
+    private String getCacheKey(String url, String format) {
+        return url + "||" + format;
     }
-    
+
+    private void storeDownloadedFilePath(String url, String format, String filePath) {
+        if (url == null || url.isBlank() || format == null || format.isBlank() || filePath == null || filePath.isBlank()) {
+            return;
+        }
+        downloadedFilePathByKey.put(getCacheKey(url, format), filePath);
+    }
+
+    public Resource getVideoAsResource(String url, String format) {
+        String path = downloadedFilePathByKey.get(getCacheKey(url, format));
+        if (path == null || path.isBlank()) {
+            return null;
+        }
+
+        File file = new File(path);
+        if (!file.exists()) {
+            downloadedFilePathByKey.remove(getCacheKey(url, format));
+            return null;
+        }
+
+        return new FileSystemResource(file);
+    }
+
     public ResponseDto downloadVideo(String url, String format) {
         if (!isValidFormat(format)) {
             return ErrorResponseDto.builder()
@@ -55,10 +84,10 @@ public class VidVacuumClient {
                     .build();
         }
         
-        // Download video first
+        // Download video first (prefer requested format options)
         String downloadedFilePath = "";
         try {
-            downloadedFilePath = downloadVideoFile(url);
+            downloadedFilePath = downloadVideoFile(url, format);
         } catch (NotFoundException e) {
             return ErrorResponseDto.builder()
                     .message("Video not found at URL: " + url)
@@ -84,37 +113,21 @@ public class VidVacuumClient {
         System.out.println("Downloaded file path: " + downloadedFilePath);
         
         // Convert to requested format
-        if (!format.equals(extractFileExtension(downloadedFilePath))) {
-            System.out.println("Converting downloaded file to format: " + format);
-            String resultFileName = "";
-            try {
-                resultFileName = convertVideo(downloadedFilePath, format);
-            } catch (Exception e) {
-                return ErrorResponseDto.builder()
-                        .message("Failed to convert video to format: " + format)
-                        .errorType("ConversionFailed")
-                        .code(500)
-                        .build();
+        String downloadedExt = extractFileExtension(downloadedFilePath).toLowerCase();
+        File downloadedFile = new File(downloadedFilePath);
+        boolean isRequestedMp4 = "mp4".equalsIgnoreCase(format);
+        boolean isDownloadedMp4 = "mp4".equalsIgnoreCase(downloadedExt);
+        boolean skipConversion = false;
+
+        if (isRequestedMp4 && !isDownloadedMp4) {
+            if (downloadedFile.exists() && downloadedFile.length() > ONE_GB) {
+                // >1GB fallback: keep whatever was downloaded and don't convert
+                skipConversion = true;
             }
-            try {
-                String downloadUrl = "/download?url=" + URLEncoder.encode(url, "UTF-8") + "&format=" + format;
-                return SuccessResponseDto.builder()
-                        .originalDownloadedFileName(extractFileName(downloadedFilePath))
-                        .resultFileName(extractFileName(resultFileName))
-                        .requestedVideoUrl(url)
-                        .requestedExtension(format)
-                        .hadToConvertExtensions(true)
-                        .downloadUrl(downloadUrl)
-                        .build();
-            } catch (Exception e) {
-                return ErrorResponseDto.builder()
-                        .message("Failed to encode download URL")
-                        .errorType("UrlEncodingFailed")
-                        .code(500)
-                        .build();
-            }
-        } else {
-            System.out.println("Downloaded file is already in the requested format: " + format);
+        }
+
+        if (format.equalsIgnoreCase(downloadedExt) || skipConversion) {
+            storeDownloadedFilePath(url, format, downloadedFilePath);
             try {
                 String downloadUrl = "/download?url=" + URLEncoder.encode(url, "UTF-8") + "&format=" + format;
                 return SuccessResponseDto.builder()
@@ -133,11 +146,59 @@ public class VidVacuumClient {
                         .build();
             }
         }
+
+        System.out.println("Converting downloaded file to format: " + format);
+        String resultFileName = "";
+        try {
+            resultFileName = convertVideo(downloadedFilePath, format);
+        } catch (Exception e) {
+            return ErrorResponseDto.builder()
+                    .message("Failed to convert video to format: " + format)
+                    .errorType("ConversionFailed")
+                    .code(500)
+                    .build();
+        }
+        storeDownloadedFilePath(url, format, resultFileName);
+        try {
+            String downloadUrl = "/download?url=" + URLEncoder.encode(url, "UTF-8") + "&format=" + format;
+            return SuccessResponseDto.builder()
+                    .originalDownloadedFileName(extractFileName(downloadedFilePath))
+                    .resultFileName(extractFileName(resultFileName))
+                    .requestedVideoUrl(url)
+                    .requestedExtension(format)
+                    .hadToConvertExtensions(true)
+                    .downloadUrl(downloadUrl)
+                    .build();
+        } catch (Exception e) {
+            return ErrorResponseDto.builder()
+                    .message("Failed to encode download URL")
+                    .errorType("UrlEncodingFailed")
+                    .code(500)
+                    .build();
+        }
     }
     
-    private String downloadVideoFile(String url) throws Exception {
+    private String downloadVideoFile(String url, String format) throws Exception {
         List<String> command = new ArrayList<>();
         command.add(ytDlpPath);
+
+        if ("mp3".equalsIgnoreCase(format)) {
+            command.add("-x");
+            command.add("--audio-format");
+            command.add("mp3");
+        } else if ("mp4".equalsIgnoreCase(format)) {
+            command.add("-f");
+            command.add("bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best");
+            command.add("--merge-output-format");
+            command.add("mp4");
+        } else if ("webm".equalsIgnoreCase(format)) {
+            command.add("-f");
+            command.add("bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]/best");
+        } else {
+            command.add("-f");
+            command.add("best");
+        }
+
         command.add("-o");
         command.add(outputPath + "/%(title)s.%(ext)s");
         command.add(url);
@@ -146,11 +207,23 @@ public class VidVacuumClient {
         pb.redirectErrorStream(true);
         Process process = pb.start();
         
+        isDownloading.set(true);
+        lastDownloadProgress.set("0%");
+        lastDownloadProgressLine.set("");
+
         BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
         String line;
         String downloadedFileFullPath = "";
         while ((line = reader.readLine()) != null) {
             System.out.println(line);
+
+            Matcher progressMatcher = downloadProgressPattern.matcher(line);
+            if (progressMatcher.find()) {
+                String progressValue = progressMatcher.group(1);
+                lastDownloadProgress.set(progressValue + "%");
+                lastDownloadProgressLine.set(line);
+            }
+
             if (line.contains(notFoundCueLine)) {
                 throw new NotFoundException();
             } else if (line.contains(privateVideoCueLine)) {
@@ -167,13 +240,16 @@ public class VidVacuumClient {
         }
         int exitCode = process.waitFor();
         if (exitCode != 0) {
+            isDownloading.set(false);
             throw new RuntimeException("yt-dlp failed with exit code: " + exitCode);
         }
         
         if (downloadedFileFullPath == null || downloadedFileFullPath.isEmpty()) {
+            isDownloading.set(false);
             throw new RuntimeException("Could not determine downloaded file path from yt-dlp output");
         }
-        
+
+        isDownloading.set(false);
         return downloadedFileFullPath;
     }
     
@@ -261,6 +337,24 @@ public class VidVacuumClient {
             return filePath.substring(lastDotIdx + 1);
         }
         return "";
+    }
+
+    public String getLastDownloadProgress() {
+        return lastDownloadProgress.get();
+    }
+
+    public String getLastDownloadProgressLine() {
+        return lastDownloadProgressLine.get();
+    }
+
+    public boolean isDownloading() {
+        return isDownloading.get();
+    }
+
+    public void resetDownloadProgress() {
+        lastDownloadProgress.set("0%");
+        lastDownloadProgressLine.set("");
+        isDownloading.set(false);
     }
 
     public int runCommand(List<String> command)  {

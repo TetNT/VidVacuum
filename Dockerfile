@@ -1,13 +1,9 @@
-# d:\VS Code projects\Unoshot\vidvacuum\Dockerfile
-
-# ---------- build stage ----------
 FROM maven:3.9.0-eclipse-temurin-17 AS build
 WORKDIR /workspace
 COPY pom.xml .
 COPY src ./src
 RUN mvn clean package -DskipTests
 
-# ---------- runtime stage ----------
 FROM eclipse-temurin:17-jdk-jammy
 
 # install python3, pip, ffmpeg and nodejs for yt-dlp JavaScript runtime

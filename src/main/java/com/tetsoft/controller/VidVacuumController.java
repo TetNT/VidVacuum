@@ -1,9 +1,12 @@
 package com.tetsoft.controller;
 
 import com.tetsoft.client.VidVacuumClient;
+import com.tetsoft.dto.ProgressResponseDto;
 import com.tetsoft.dto.ResponseDto;
 
 import java.io.File;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.FileSystemResource;
@@ -44,11 +47,31 @@ public class VidVacuumController {
         }
         File file = ((FileSystemResource) resource).getFile();
         String contentType = getContentType(format);
+
+        String displayName = file.getName();
+        String asciiName = displayName.replaceAll("[^\\x20-\\x7E]", "_");
+        String encodedName = URLEncoder.encode(displayName, StandardCharsets.UTF_8);
+
+        String disposition = "attachment; filename=\"" + asciiName + "\"; filename*=UTF-8''" + encodedName;
+
         return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION,
-                        "attachment; filename=\"" + file.getName() + "\"")
+                .header(HttpHeaders.CONTENT_DISPOSITION, disposition)
                 .header(HttpHeaders.CONTENT_TYPE, contentType)
                 .body(resource);
+    }
+
+    @GetMapping("/download/progress")
+    public ResponseEntity<ProgressResponseDto> getDownloadProgress() {
+        String progress = vidVacuumClient.getLastDownloadProgress();
+        String message = vidVacuumClient.getLastDownloadProgressLine();
+        boolean downloading = vidVacuumClient.isDownloading();
+
+        if (progress == null || progress.isBlank()) {
+            progress = "0%";
+        }
+
+        ProgressResponseDto dto = new ProgressResponseDto(progress, message, downloading);
+        return ResponseEntity.ok(dto);
     }
 
     private String getContentType(String format) {
